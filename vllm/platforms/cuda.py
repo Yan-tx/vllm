@@ -238,6 +238,7 @@ class CudaPlatformBase(Platform):
             FLEX_ATTENTION_V1 = "vllm.v1.attention.backends.flex_attention.FlexAttentionBackend"  # noqa: E501
             TRITON_ATTN_VLLM_V1 = "vllm.v1.attention.backends.triton_attn.TritonAttentionBackend"  # noqa: E501
             FLASH_ATTN_V1 = "vllm.v1.attention.backends.flash_attn.FlashAttentionBackend"  # noqa: E501
+            OOC_ATTN_V1 = "vllm.v1.attention.backends.ooc_attn.OocAttentionBackend"
 
             if selected_backend == _Backend.FLASHINFER:
                 logger.info_once("Using FlashInfer backend on V1 engine.")
@@ -248,6 +249,9 @@ class CudaPlatformBase(Platform):
             elif selected_backend == _Backend.TRITON_ATTN_VLLM_V1:
                 logger.info_once("Using Triton backend on V1 engine.")
                 return TRITON_ATTN_VLLM_V1
+            elif selected_backend == _Backend.OOC_ATTN:
+                logger.info_once("Using OOC attention backend on V1 engine.")
+                return OOC_ATTN_V1
             elif selected_backend == _Backend.FLASH_ATTN:
                 logger.info_once("Using Flash Attention backend on V1 engine.")
                 return FLASH_ATTN_V1

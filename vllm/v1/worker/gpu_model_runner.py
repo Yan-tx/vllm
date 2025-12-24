@@ -3,6 +3,7 @@
 
 import copy
 import gc
+import os
 import time
 import weakref
 from contextlib import contextmanager
@@ -2421,11 +2422,51 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             dict[str, torch.Tensor]: A map between layer names to their
             corresponding memory buffer for KV cache.
          """
+        use_ooc_cpu_kv = os.getenv("VLLM_OOC_KV_CPU", "")
+        use_ooc_cpu_kv = use_ooc_cpu_kv not in ("", "0", "false", "False")
+        use_ooc_hybrid = os.getenv("VLLM_OOC_KV_HYBRID", "")
+        use_ooc_hybrid = use_ooc_hybrid not in ("", "0", "false", "False")
+        use_ooc_kv = use_ooc_cpu_kv or use_ooc_hybrid
+        if use_ooc_kv:
+            for backend in self.attn_backends:
+                backend_name = (backend.get_name()
+                                if hasattr(backend, "get_name") else None)
+                if backend_name != "OOC_ATTN":
+                    logger.warning(
+                        "OOC KV cache is enabled but backend %s is not "
+                        "OOC_ATTN; disabling OOC KV cache.",
+                        getattr(backend, "__name__", str(backend)),
+                    )
+                    use_ooc_kv = False
+                    use_ooc_cpu_kv = False
+                    use_ooc_hybrid = False
+                    break
+            if use_ooc_kv:
+                if use_ooc_hybrid and use_ooc_cpu_kv:
+                    logger.warning(
+                        "Both VLLM_OOC_KV_CPU and VLLM_OOC_KV_HYBRID are set; "
+                        "using full CPU KV mode.")
+                    use_ooc_hybrid = False
+                if use_ooc_hybrid:
+                    logger.info_once("OOC_ATTN hybrid KV cache enabled.")
+                else:
+                    logger.info_once("OOC_ATTN CPU KV cache enabled.")
+
         kv_cache_raw_tensors: dict[str, torch.Tensor] = {}
         for kv_cache_tensor in kv_cache_config.kv_cache_tensors:
-            tensor = torch.zeros(kv_cache_tensor.size,
-                                 dtype=torch.int8,
-                                 device=self.device)
+            if use_ooc_kv:
+                tensor = torch.zeros(
+                    kv_cache_tensor.size,
+                    dtype=torch.int8,
+                    device="cpu",
+                    pin_memory=self.pin_memory,
+                )
+            else:
+                tensor = torch.zeros(
+                    kv_cache_tensor.size,
+                    dtype=torch.int8,
+                    device=self.device,
+                )
             for layer_name in kv_cache_tensor.shared_by:
                 kv_cache_raw_tensors[layer_name] = tensor
 

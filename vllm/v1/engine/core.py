@@ -21,6 +21,7 @@ from vllm.config import ParallelConfig, VllmConfig
 from vllm.distributed import stateless_destroy_torch_distributed_process_group
 from vllm.executor.multiproc_worker_utils import _add_prefix
 from vllm.logger import init_logger
+from vllm.utils import GiB_bytes
 from vllm.logging_utils.dump_input import dump_engine_exception
 from vllm.lora.request import LoRARequest
 from vllm.transformers_utils.config import (
@@ -140,6 +141,19 @@ class EngineCore:
         # Profiles the peak memory usage of the model to determine how much
         # memory can be allocated for kv cache.
         available_gpu_memory = self.model_executor.determine_available_memory()
+        ooc_total_gb = os.getenv("VLLM_OOC_KV_TOTAL_GB")
+        ooc_mode = os.getenv("VLLM_OOC_KV_CPU", "") or os.getenv("VLLM_OOC_KV_HYBRID", "")
+        if ooc_total_gb and ooc_mode:
+            try:
+                ooc_bytes = int(float(ooc_total_gb) * GiB_bytes)
+            except ValueError as exc:
+                raise ValueError("VLLM_OOC_KV_TOTAL_GB must be a number") from exc
+            if isinstance(available_gpu_memory, (list, tuple)):
+                available_gpu_memory = [ooc_bytes] * len(available_gpu_memory)
+            else:
+                available_gpu_memory = [ooc_bytes]
+            logger.info_once("OOC KV total budget override: %.2f GiB",
+                             ooc_bytes / GiB_bytes)
 
         assert len(kv_cache_specs) == len(available_gpu_memory)
         # Get the kv cache tensor size
