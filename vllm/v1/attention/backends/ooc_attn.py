@@ -268,13 +268,22 @@ class OocAttentionImpl(AttentionImpl[OocAttentionMetadata]):
     def _get_layer_key(self, layer) -> str:
         if self._layer_key is not None:
             return self._layer_key
+        layer_key = getattr(layer, "_ooc_layer_key", None)
+        if layer_key:
+            self._layer_key = layer_key
+            return layer_key
         layer_idx = getattr(layer, "layer_idx", None)
         if layer_idx is None:
             layer_idx = getattr(layer, "layer_id", None)
         if layer_idx is None:
             layer_idx = id(layer)
-        self._layer_key = f"layer_{layer_idx}_pid_{os.getpid()}"
-        return self._layer_key
+        layer_key = f"layer_{layer_idx}_pid_{os.getpid()}"
+        self._layer_key = layer_key
+        try:
+            setattr(layer, "_ooc_layer_key", layer_key)
+        except Exception:
+            pass
+        return layer_key
 
     def _maybe_init_page_manager(self, layer, kv_cache: torch.Tensor) -> None:
         if not self._spill_enabled:
@@ -282,12 +291,23 @@ class OocAttentionImpl(AttentionImpl[OocAttentionMetadata]):
         if kv_cache.device.type != "cpu":
             return
         cache_id = id(kv_cache)
+        existing = getattr(layer, "_ooc_page_manager", None)
+        existing_id = getattr(layer, "_ooc_page_manager_kv_cache_id", None)
+        if existing is not None and existing_id == cache_id:
+            self._page_manager = existing
+            self._page_manager_kv_cache_id = cache_id
+            return
         if (self._page_manager is None
                 or self._page_manager_kv_cache_id != cache_id):
             store = FileBlockStore(self._ooc_store_dir,
                                    self._get_layer_key(layer))
             self._page_manager = OocPageManager(store, kv_cache)
             self._page_manager_kv_cache_id = cache_id
+            try:
+                setattr(layer, "_ooc_page_manager", self._page_manager)
+                setattr(layer, "_ooc_page_manager_kv_cache_id", cache_id)
+            except Exception:
+                pass
 
     @staticmethod
     def _write_kv_cache_cpu(
