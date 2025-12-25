@@ -22,6 +22,10 @@ from vllm.attention.backends.abstract import (
 from vllm.attention.utils.fa_utils import reshape_and_cache_flash
 from vllm.logger import init_logger
 from vllm.utils import GiB_bytes
+from vllm.v1.attention.backends.ooc_kv_store import (
+    FileBlockStore,
+    OocPageManager,
+)
 from vllm.v1.attention.backends.utils import (
     AttentionMetadataBuilder,
     CommonAttentionMetadata,
@@ -168,6 +172,11 @@ class OocAttentionImpl(AttentionImpl[OocAttentionMetadata]):
         self.attn_type = attn_type
         self.kv_cache_dtype = kv_cache_dtype
         self.kv_sharing_target_layer_name = kv_sharing_target_layer_name
+        self._ooc_store_dir = os.getenv("VLLM_OOC_KV_STORE_DIR", "")
+        self._spill_enabled = self._ooc_store_dir not in ("", "0", "false", "False")
+        self._page_manager: OocPageManager | None = None
+        self._page_manager_kv_cache_id: int | None = None
+        self._layer_key: str | None = None
         self._ooc_hybrid = os.getenv("VLLM_OOC_KV_HYBRID",
                                      "") not in ("", "0", "false", "False")
         self._gpu_kv_blocks_env = os.getenv("VLLM_OOC_KV_GPU_BLOCKS")
@@ -256,6 +265,30 @@ class OocAttentionImpl(AttentionImpl[OocAttentionMetadata]):
             self._gpu_kv_blocks = gpu_blocks
             self._gpu_kv_cache_shape = desired_shape
 
+    def _get_layer_key(self, layer) -> str:
+        if self._layer_key is not None:
+            return self._layer_key
+        layer_idx = getattr(layer, "layer_idx", None)
+        if layer_idx is None:
+            layer_idx = getattr(layer, "layer_id", None)
+        if layer_idx is None:
+            layer_idx = id(layer)
+        self._layer_key = f"layer_{layer_idx}_pid_{os.getpid()}"
+        return self._layer_key
+
+    def _maybe_init_page_manager(self, layer, kv_cache: torch.Tensor) -> None:
+        if not self._spill_enabled:
+            return
+        if kv_cache.device.type != "cpu":
+            return
+        cache_id = id(kv_cache)
+        if (self._page_manager is None
+                or self._page_manager_kv_cache_id != cache_id):
+            store = FileBlockStore(self._ooc_store_dir,
+                                   self._get_layer_key(layer))
+            self._page_manager = OocPageManager(store, kv_cache)
+            self._page_manager_kv_cache_id = cache_id
+
     @staticmethod
     def _write_kv_cache_cpu(
         key_cache: torch.Tensor,
@@ -266,6 +299,7 @@ class OocAttentionImpl(AttentionImpl[OocAttentionMetadata]):
         block_size: int,
         gpu_kv_cache: torch.Tensor | None = None,
         gpu_blocks: int = 0,
+        page_manager: OocPageManager | None = None,
     ) -> None:
         slot_mapping_cpu = slot_mapping
         if slot_mapping_cpu.device.type != "cpu":
@@ -275,6 +309,11 @@ class OocAttentionImpl(AttentionImpl[OocAttentionMetadata]):
 
         key_cpu = key.detach().to("cpu", non_blocking=True)
         value_cpu = value.detach().to("cpu", non_blocking=True)
+        if slot_mapping_cpu.numel() < key_cpu.shape[0]:
+            padded = torch.full((key_cpu.shape[0],), -1,
+                                dtype=slot_mapping_cpu.dtype)
+            padded[:slot_mapping_cpu.numel()] = slot_mapping_cpu
+            slot_mapping_cpu = padded
         key_gpu = key
         value_gpu = value
 
@@ -291,10 +330,27 @@ class OocAttentionImpl(AttentionImpl[OocAttentionMetadata]):
         block_ids = slot_mapping_cpu // block_size
         block_offsets = slot_mapping_cpu % block_size
 
-        key_cache[block_ids, block_offsets] = key_cpu
-        value_cache[block_ids, block_offsets] = value_cpu
+        virtual_ids = None
+        if page_manager is not None:
+            virtual_ids = block_ids.tolist()
+            unique_ids = list(dict.fromkeys(virtual_ids))
+            for virt_id in unique_ids:
+                page_manager.ensure_blocks([virt_id], for_read=False)
+                page_manager.pin_blocks([virt_id])
+                try:
+                    phys_id = page_manager.map_block_ids([virt_id])[0]
+                    idxs = [i for i, v in enumerate(virtual_ids) if v == virt_id]
+                    idx_tensor = torch.tensor(idxs, dtype=torch.long)
+                    key_cache[phys_id, block_offsets[idx_tensor]] = key_cpu[idx_tensor]
+                    value_cache[phys_id, block_offsets[idx_tensor]] = value_cpu[idx_tensor]
+                finally:
+                    page_manager.unpin_blocks([virt_id])
+        else:
+            key_cache[block_ids, block_offsets] = key_cpu
+            value_cache[block_ids, block_offsets] = value_cpu
 
-        if gpu_kv_cache is not None and gpu_blocks > 0:
+        if (gpu_kv_cache is not None and gpu_blocks > 0
+                and page_manager is None):
             gpu_mask = block_ids < gpu_blocks
             if gpu_mask.any():
                 gpu_idx = torch.nonzero(gpu_mask, as_tuple=False).squeeze(-1)
@@ -403,7 +459,16 @@ class OocAttentionImpl(AttentionImpl[OocAttentionMetadata]):
             raise NotImplementedError("OOC_ATTN MVP only supports CUDA.")
 
         kv_on_cpu = kv_cache.device.type == "cpu"
-        use_hybrid = kv_on_cpu and self._ooc_hybrid
+        use_spill = kv_on_cpu and self._spill_enabled
+        if use_spill:
+            self._maybe_init_page_manager(layer, kv_cache)
+            if self._page_manager is None:
+                logger.warning("OOC spill store enabled but page manager is not available.")
+                use_spill = False
+
+        use_hybrid = kv_on_cpu and self._ooc_hybrid and not use_spill
+        if use_spill and self._ooc_hybrid:
+            logger.info_once("OOC spill store enabled; disabling GPU mirror.")
         if use_hybrid:
             self._ensure_gpu_kv_cache(kv_cache)
             if self._gpu_kv_blocks <= 0:
@@ -425,6 +490,7 @@ class OocAttentionImpl(AttentionImpl[OocAttentionMetadata]):
                     key_cache_cpu.shape[1],
                     gpu_kv_cache=self._gpu_kv_cache if use_hybrid else None,
                     gpu_blocks=self._gpu_kv_blocks if use_hybrid else 0,
+                    page_manager=self._page_manager if use_spill else None,
                 )
             else:
                 reshape_and_cache_flash(
@@ -477,7 +543,25 @@ class OocAttentionImpl(AttentionImpl[OocAttentionMetadata]):
             else:
                 block_ids = block_table[req_idx, :num_blocks].to(torch.long)
 
-            if kv_on_cpu and use_hybrid:
+            if kv_on_cpu and use_spill:
+                virtual_ids = block_ids.tolist()
+                page_manager = self._page_manager
+                page_manager.ensure_blocks(virtual_ids, for_read=True)
+                page_manager.pin_blocks(virtual_ids)
+                try:
+                    physical_ids = page_manager.map_block_ids(virtual_ids)
+                    block_ids = torch.tensor(physical_ids, dtype=torch.long)
+                    k = key_cache.index_select(0, block_ids).reshape(
+                        num_blocks * block_size, self.num_kv_heads,
+                        self.head_size)[:seq_len]
+                    v = value_cache.index_select(0, block_ids).reshape(
+                        num_blocks * block_size, self.num_kv_heads,
+                        self.head_size)[:seq_len]
+                    k = k.to(query.device, non_blocking=True)
+                    v = v.to(query.device, non_blocking=True)
+                finally:
+                    page_manager.unpin_blocks(virtual_ids)
+            elif kv_on_cpu and use_hybrid:
                 k_blocks, v_blocks = self._gather_kv_blocks_hybrid(
                     key_cache,
                     value_cache,

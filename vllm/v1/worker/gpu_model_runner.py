@@ -2452,11 +2452,61 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                 else:
                     logger.info_once("OOC_ATTN CPU KV cache enabled.")
 
+        layer_page_sizes: dict[str, int] = {}
+        for group in kv_cache_config.kv_cache_groups:
+            page_size = group.kv_cache_spec.page_size_bytes
+            for layer_name in group.layer_names:
+                layer_page_sizes[layer_name] = page_size
+
+        cpu_blocks_override = None
+        cpu_bytes_per_layer = None
+        if use_ooc_kv:
+            cpu_blocks_env = os.getenv("VLLM_OOC_KV_CPU_BLOCKS")
+            cpu_gb_env = os.getenv("VLLM_OOC_KV_CPU_GB")
+            if cpu_blocks_env:
+                try:
+                    cpu_blocks_override = int(cpu_blocks_env)
+                except ValueError as exc:
+                    raise ValueError("VLLM_OOC_KV_CPU_BLOCKS must be an integer") from exc
+            elif cpu_gb_env:
+                try:
+                    cpu_total_bytes = float(cpu_gb_env) * GiB_bytes
+                except ValueError as exc:
+                    raise ValueError("VLLM_OOC_KV_CPU_GB must be a number") from exc
+                num_layers = max(len(kv_cache_config.kv_cache_tensors), 1)
+                cpu_bytes_per_layer = cpu_total_bytes / num_layers
+
         kv_cache_raw_tensors: dict[str, torch.Tensor] = {}
+        logged_cpu_cap = False
         for kv_cache_tensor in kv_cache_config.kv_cache_tensors:
+            tensor_size = kv_cache_tensor.size
+            if use_ooc_kv and (cpu_blocks_override is not None
+                              or cpu_bytes_per_layer is not None):
+                layer_name = kv_cache_tensor.shared_by[0]
+                page_size = layer_page_sizes.get(layer_name)
+                if page_size:
+                    max_blocks = tensor_size // page_size
+                    if cpu_blocks_override is not None:
+                        blocks = min(max(cpu_blocks_override, 1), max_blocks)
+                    else:
+                        blocks = int(cpu_bytes_per_layer // page_size) if cpu_bytes_per_layer is not None else max_blocks
+                        if blocks < 1:
+                            blocks = 1
+                        if blocks > max_blocks:
+                            blocks = max_blocks
+                    if blocks < max_blocks:
+                        tensor_size = blocks * page_size
+                        if not logged_cpu_cap:
+                            logger.info_once(
+                                "OOC KV CPU block cap: %d/%d blocks per layer (page_size=%d bytes)",
+                                blocks,
+                                max_blocks,
+                                page_size,
+                            )
+                            logged_cpu_cap = True
             if use_ooc_kv:
                 tensor = torch.zeros(
-                    kv_cache_tensor.size,
+                    tensor_size,
                     dtype=torch.int8,
                     device="cpu",
                     pin_memory=self.pin_memory,
