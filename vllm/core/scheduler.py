@@ -1,10 +1,11 @@
 import enum
+import importlib
 import os
 import random
 import time
 from collections import deque
 from dataclasses import dataclass, field
-from typing import Callable, Deque, Dict, Iterable, List, Optional
+from typing import Any, Callable, Deque, Dict, Iterable, List, Optional
 from typing import Sequence as GenericSequence
 from typing import Set, Tuple, Union
 
@@ -328,6 +329,7 @@ class Scheduler:
         lora_config: Optional[LoRAConfig],
         pipeline_parallel_size: int = 1,
         output_proc_callback: Optional[Callable] = None,
+        kv_transfer_config: Optional[Any] = None,
     ) -> None:
         self.scheduler_config = scheduler_config
         self.cache_config = cache_config
@@ -335,6 +337,10 @@ class Scheduler:
         # simple and NOT fair. It can lead to starvation of some
         # LoRAs. This should be improved in the future.
         self.lora_config = lora_config
+        self.kv_transfer_config = kv_transfer_config
+        self._external_kv_probe = None
+        self._external_kv_probe_loaded = False
+        self._external_kv_match_cache: Dict[Tuple[str, int, int], int] = {}
 
         version = "selfattn"
         if (self.scheduler_config.runner_type == "pooling"
@@ -503,6 +509,71 @@ class Scheduler:
 
     def get_prefix_cache_hit_rate(self, device: Device) -> float:
         return self.block_manager.get_prefix_cache_hit_rate(device)
+
+    def _get_external_kv_probe(self):
+        if self._external_kv_probe_loaded:
+            return self._external_kv_probe
+        self._external_kv_probe_loaded = True
+        kvt = self.kv_transfer_config
+        if kvt is None or getattr(kvt, "kv_connector", None) is None:
+            return None
+        module_path = getattr(kvt, "kv_connector_module_path", None)
+        if not module_path:
+            return None
+        try:
+            module = importlib.import_module(module_path)
+            self._external_kv_probe = getattr(
+                module, "get_scheduler_matched_tokens", None)
+        except Exception:
+            logger.exception("Failed to load external KV scheduler probe")
+            self._external_kv_probe = None
+        return self._external_kv_probe
+
+    def _get_external_kv_cached_tokens(self, seq_group: SequenceGroup,
+                                       seq: Sequence) -> int:
+        probe = self._get_external_kv_probe()
+        if probe is None:
+            return 0
+        cache_key = (seq_group.request_id, seq.seq_id, seq.get_len())
+        if cache_key in self._external_kv_match_cache:
+            return self._external_kv_match_cache[cache_key]
+        try:
+            matched = int(
+                probe(
+                    self.kv_transfer_config,
+                    seq.get_token_ids(),
+                    self.cache_config.block_size,
+                    request_id=seq_group.request_id,
+                    seq_id=seq.seq_id,
+                ) or 0)
+        except Exception:
+            logger.exception("External KV scheduler probe failed")
+            matched = 0
+        matched = max(0, min(matched, seq.get_len()))
+        matched = (matched // self.cache_config.block_size
+                   ) * self.cache_config.block_size
+        self._external_kv_match_cache[cache_key] = matched
+        if matched > 0:
+            logger.info("[external-kv] scheduler matched %d/%d tokens for "
+                        "request=%s seq=%s", matched, seq.get_len(),
+                        seq_group.request_id, seq.seq_id)
+        return matched
+
+    def _get_external_kv_computed_block_ids(
+            self, seq_group: SequenceGroup, seqs: List[Sequence],
+            block_tables: Dict[int, List[int]]) -> List[int]:
+        common: Optional[List[int]] = None
+        for seq in seqs:
+            matched = self._get_external_kv_cached_tokens(seq_group, seq)
+            num_blocks = matched // self.cache_config.block_size
+            ids = list(block_tables.get(seq.seq_id, [])[:num_blocks])
+            common = ids if common is None else common[:min(len(common), len(ids))]
+            if common is not None:
+                for idx, block_id in enumerate(list(common)):
+                    if idx >= len(ids) or ids[idx] != block_id:
+                        common = common[:idx]
+                        break
+        return common or []
 
     def get_num_unfinished_seq_groups(self) -> int:
         return len(self.waiting) + len(self.running) + len(self.swapped)
@@ -1334,10 +1405,16 @@ class Scheduler:
                 block_tables[seq_id] = self.block_manager.get_block_table(seq)
                 self.block_manager.access_all_blocks_in_seq(seq, now)
 
-            if self.cache_config.enable_prefix_caching:
+            running_seqs = seq_group.get_seqs(status=SequenceStatus.RUNNING)
+            external_computed_block_nums = (
+                self._get_external_kv_computed_block_ids(
+                    seq_group, running_seqs, block_tables))
+            if external_computed_block_nums:
+                common_computed_block_nums = external_computed_block_nums
+            elif self.cache_config.enable_prefix_caching:
                 common_computed_block_nums = (
                     self.block_manager.get_common_computed_block_ids(
-                        seq_group.get_seqs(status=SequenceStatus.RUNNING)))
+                        running_seqs))
 
             do_sample = True
             is_prompt = seq_group.is_prefill()
@@ -1710,9 +1787,15 @@ class Scheduler:
 
             num_computed_tokens_seq = seq.get_num_computed_tokens()
             all_num_new_tokens_seq = seq.get_len() - num_computed_tokens_seq
+            external_cached_tokens_seq = self._get_external_kv_cached_tokens(
+                seq_group, seq)
             if not self.cache_config.enable_prefix_caching:
-                # If prefix caching is not enabled, all new tokens are uncached.
-                num_uncached_new_tokens += all_num_new_tokens_seq
+                num_cached_new_tokens_seq = max(
+                    0, external_cached_tokens_seq - num_computed_tokens_seq)
+                num_uncached_new_tokens_seq = (all_num_new_tokens_seq -
+                                               num_cached_new_tokens_seq)
+                num_uncached_new_tokens += num_uncached_new_tokens_seq
+                num_cached_new_tokens += num_cached_new_tokens_seq
                 continue
 
             # NOTE: the cache token might be currently in a block that's in an
@@ -1740,6 +1823,8 @@ class Scheduler:
                     f"tokens and {num_computed_tokens_seq} computed tokens "
                     f"for sequence {seq.seq_id}.")
 
+            num_cached_tokens_seq = max(num_cached_tokens_seq,
+                                        external_cached_tokens_seq)
             num_cached_new_tokens_seq = max(
                 0, num_cached_tokens_seq - num_computed_tokens_seq)
             num_uncached_new_tokens_seq = (all_num_new_tokens_seq -

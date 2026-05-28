@@ -349,7 +349,8 @@ class LLMEngine:
                 self.scheduler_config, self.cache_config, self.lora_config,
                 self.parallel_config.pipeline_parallel_size,
                 self.async_callbacks[v_id]
-                if self.model_config.use_async_output_proc else None)
+                if self.model_config.use_async_output_proc else None,
+                self.vllm_config.kv_transfer_config)
             for v_id in range(self.parallel_config.pipeline_parallel_size)
         ]
 

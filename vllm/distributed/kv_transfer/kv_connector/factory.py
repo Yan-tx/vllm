@@ -26,11 +26,17 @@ class KVConnectorFactory:
     @classmethod
     def create_connector(cls, rank: int, local_rank: int,
                          config: "VllmConfig") -> KVConnectorBase:
-        connector_name = config.kv_transfer_config.kv_connector
-        if connector_name not in cls._registry:
-            raise ValueError(f"Unsupported connector type: {connector_name}")
+        kv_transfer_config = config.kv_transfer_config
+        connector_name = kv_transfer_config.kv_connector
+        if connector_name in cls._registry:
+            connector_cls = cls._registry[connector_name]()
+        else:
+            module_path = getattr(kv_transfer_config, "kv_connector_module_path", None)
+            if module_path is None:
+                raise ValueError(f"Unsupported connector type: {connector_name}")
+            module = importlib.import_module(module_path)
+            connector_cls = getattr(module, connector_name)
 
-        connector_cls = cls._registry[connector_name]()
         return connector_cls(rank, local_rank, config)
 
 

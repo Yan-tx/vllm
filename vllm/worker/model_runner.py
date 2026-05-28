@@ -449,6 +449,7 @@ class ModelInputForGPUBuilder(ModelRunnerInputBuilderBase[ModelInputForGPU]):
 
         self.runner = runner
         self.model_input_cls = self.runner._model_input_cls
+        self.seq_group_metadata_list = []
         self.attn_backend = self.runner.attn_backend
         self.scheduler_config = self.runner.scheduler_config
         self.sliding_window = self.runner.sliding_window
@@ -746,6 +747,7 @@ class ModelInputForGPUBuilder(ModelRunnerInputBuilderBase[ModelInputForGPU]):
             encoder_seq_len=encoder_seq_len)
 
         self.inter_data_list.append(inter_data)
+        self.seq_group_metadata_list.append(seq_group_metadata)
 
         for seq_idx in range(n_seqs):
             for per_seq_fn in self.per_seq_compute_fns:
@@ -985,7 +987,8 @@ class ModelInputForGPUBuilder(ModelRunnerInputBuilderBase[ModelInputForGPU]):
             request_ids_to_seq_ids=request_ids_to_seq_ids,
             finished_requests_ids=self.finished_requests_ids,
             prompt_adapter_mapping=prompt_adapter_mapping,
-            prompt_adapter_requests=prompt_adapter_requests)
+            prompt_adapter_requests=prompt_adapter_requests,
+            seq_group_metadata_list=self.seq_group_metadata_list)
 
 
 class GPUModelRunnerBase(ModelRunnerBase[TModelInputForGPU]):
